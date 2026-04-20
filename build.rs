@@ -1,7 +1,7 @@
-// ========== DOSYA: sentinel-intelligence/build.rs ==========
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tonic_build::configure()
-        .build_client(false) // Bu repo sunucu (server) olacak
-        .compile(&["proto/intelligence.proto"], &["proto/"])?;
+    tonic_build::configure().build_client(false).compile(
+        &["sentinel-spec/proto/sentinel/intelligence/v1/intelligence.proto"],
+        &["sentinel-spec/proto/"],
+    )?;
     Ok(())
 }
