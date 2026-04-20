@@ -1,10 +1,14 @@
+// ========== DOSYA: sentinel-intelligence/src/main.rs ==========
 use tonic::{transport::Server, Request, Response, Status};
-use intelligence::sentiment_analyzer_server::{SentimentAnalyzer, SentimentAnalyzerServer};
-use intelligence::{SentimentRequest, SentimentResponse};
+use tracing::{info, error};
 
+// Protobuf tarafından üretilen kodları bu modül altına alıyoruz
 pub mod intelligence {
     tonic::include_proto!("sentinel.intelligence");
 }
+
+use intelligence::sentiment_analyzer_server::{SentimentAnalyzer, SentimentAnalyzerServer};
+use intelligence::{SentimentRequest, SentimentResponse};
 
 #[derive(Debug, Default)]
 pub struct MySentimentAnalyzer {}
@@ -17,13 +21,17 @@ impl SentimentAnalyzer for MySentimentAnalyzer {
     ) -> Result<Response<SentimentResponse>, Status> {
         let text = request.into_inner().text;
         
-        // --- BURASI KRİTİK: GPU/AI MANTIĞI ---
-        // Şimdilik kural tabanlı, ileride Candle/CUDA entegre edilecek
+        // HFT Zekası: Şimdilik kural tabanlı, ileride Candle/CUDA entegrasyonu buraya gelecek.
         let mut score = 0.0;
-        if text.contains("bullish") || text.contains("moon") { score = 0.85; }
-        if text.contains("crash") || text.contains("dump") { score = -0.90; }
+        let lower_text = text.to_lowercase();
+        
+        if lower_text.contains("bullish") || lower_text.contains("moon") || lower_text.contains("recovery") {
+            score = 0.85;
+        } else if lower_text.contains("crash") || lower_text.contains("dump") || lower_text.contains("resistance") {
+            score = -0.90;
+        }
 
-        println!("🤖 [AI-RUST] İşlenen: '{}' | Skor: {}", text, score);
+        info!("🤖 [AI-RUST] İşlenen: '{}' | Skor: {}", text, score);
 
         Ok(Response::new(SentimentResponse { score }))
     }
@@ -31,11 +39,13 @@ impl SentimentAnalyzer for MySentimentAnalyzer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Loglamayı başlat
     tracing_subscriber::fmt::init();
+
     let addr = "0.0.0.0:50051".parse()?;
     let analyzer = MySentimentAnalyzer::default();
 
-    println!("⚡ Sentinel-Intelligence (Rust/GPU-Ready) dinliyor: {}", addr);
+    info!("⚡ Sentinel-Intelligence (Rust Server) dinliyor: {}", addr);
 
     Server::builder()
         .add_service(SentimentAnalyzerServer::new(analyzer))

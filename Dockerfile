@@ -1,18 +1,18 @@
 # ========== DOSYA: sentinel-intelligence/Dockerfile ==========
 FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
-# Sistem bağımlılıkları
+# Sistem bağımlılıkları (Rust ve Protobuf derleyicisi için)
 RUN apt-get update && apt-get install -y \
-    build-essential cmake git pkg-config \
-    libgrpc++-dev protobuf-compiler-grpc \
-    libprotobuf-dev
+    curl build-essential protobuf-compiler libssl-dev pkg-config
+
+# Rust kurulumu
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 COPY . .
 
-# Derleme
-RUN mkdir build && cd build && \
-    cmake .. && \
-    make -j$(nproc)
+# Release build
+RUN cargo build --release
 
-CMD ["./build/sentinel_intelligence"]
+CMD ["./target/release/sentinel-intelligence"]
