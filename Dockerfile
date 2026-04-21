@@ -1,17 +1,23 @@
 # ========== DOSYA: sentinel-intelligence/Dockerfile ==========
-FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
+# 1. Derleme Aşaması
+FROM rust:1.95-slim-bookworm AS builder
 
-RUN apt-get update && apt-get install -y \
-    curl build-essential protobuf-compiler libssl-dev pkg-config git
+# Sistem bağımlılıkları (Protobuf derleyicisi için şart)
+RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev
 
-# Rust'ı doğrudan kuruyoruz
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-WORKDIR /app
+WORKDIR /usr/src/app
 COPY . .
 
-# Cache temizliği ve derleme
+# Release derlemesi
 RUN cargo build --release
 
-CMD ["./target/release/sentinel-intelligence"]
+# 2. Çalıştırma Aşaması (Tertemiz ve Küçük)
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+# Binaries ismini cargo build çıktısından kopyala
+COPY --from=builder /usr/src/app/target/release/sentinel-intelligence .
+
+CMD ["./sentinel-intelligence"]
