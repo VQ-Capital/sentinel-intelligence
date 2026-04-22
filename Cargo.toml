@@ -1,3 +1,4 @@
+# ========== DOSYA: sentinel-intelligence/Cargo.toml ==========
 [package]
 name = "sentinel-intelligence"
 version = "0.1.0"
@@ -10,8 +11,17 @@ prost = "0.12"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1.0"
-# HFT Hızında Statik Sözlük Araması için:
 phf = { version = "0.11", features = ["macros"] }
+
+# NATIVE ML (CANDLE) BAĞIMLILIKLARI
+candle-core = "0.4.1"
+candle-nn = "0.4.1"
+
+# 🚨 DEPENDENCY HELL ÇÖZÜCÜ (STABILITY LOCK) 🚨
+# rand 0.9.x güncellemesi, candle-core'un kullandığı half (f16/bf16)
+# trait'lerini bozduğu için bu iki kütüphaneyi eski stabil sürüme çiviliyoruz.
+half = "=2.3.1"
+rand = "=0.8.5"
 
 [build-dependencies]
 tonic-build = "0.11"
