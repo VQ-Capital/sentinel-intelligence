@@ -4,10 +4,9 @@ use futures_util::StreamExt;
 use ort::{session::Session, value::Value};
 use phf::phf_map;
 use prost::Message;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex}; // FIX: std::sync::Mutex eklendi (Senkron kilit)
 use std::time::Instant;
 use tokenizers::Tokenizer;
-use tokio::sync::RwLock; // FIX: Interior Mutability için eklendi
 use tokio::time::{timeout, Duration};
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{error, info, warn};
@@ -41,15 +40,18 @@ static FAST_PATH_WORDS: phf::Map<&'static str, f64> = phf_map! {
 };
 
 // -----------------------------------------------------------------------------
-// 🤖 TIER-1: NEURAL ENGINE
+// 🤖 TIER-1: NEURAL ENGINE (Thread-Safe & Zero-Blocking)
 // -----------------------------------------------------------------------------
 struct NeuralBrain {
-    session: RwLock<Session>, // FIX: Mutability hatasını çözmek için RwLock eklendi
+    // FIX: Tokio kilidi değil, standart donanım kilidi kullanıyoruz.
+    // Blocking thread içinde kullanılacağı için en performanslısı budur.
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
 }
 
 impl NeuralBrain {
-    async fn predict(&self, text: &str) -> Result<f64> {
+    // FIX: Referans immutable (&self) kalıyor, interior mutability Mutex üzerinden sağlanıyor.
+    fn predict_sync(&self, text: &str) -> Result<f64> {
         let tokens = self
             .tokenizer
             .encode(text, true)
@@ -61,8 +63,12 @@ impl NeuralBrain {
         let mask = Value::from_array(([1, seq_len], vec![1i64; seq_len]))?;
         let type_ids = Value::from_array(([1, seq_len], vec![0i64; seq_len]))?;
 
-        // FIX: Mutable borrow hatasını RwLock yazma kilidi alarak çözüyoruz
-        let mut session_guard = self.session.write().await;
+        // FIX: Mutex kilidini alıyoruz (Sadece model inference süresince kilitler)
+        let mut session_guard = self
+            .session
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))?;
+
         let outputs = session_guard.run(ort::inputs![
             "input_ids" => input_ids,
             "attention_mask" => mask,
@@ -94,14 +100,14 @@ impl SentimentAnalyzerService for VQIntelligence {
         request: Request<AnalyzeTextRequest>,
     ) -> Result<Response<AnalyzeTextResponse>, Status> {
         let text = request.into_inner().text;
-        let (score, _) = self.process_full_stack(&text).await;
+        let (score, _) = self.process_full_stack(text).await;
         Ok(Response::new(AnalyzeTextResponse { score }))
     }
 }
 
 impl VQIntelligence {
-    async fn process_full_stack(&self, text: &str) -> (f64, &'static str) {
-        // Tier-0: Lexicon
+    async fn process_full_stack(&self, text: String) -> (f64, &'static str) {
+        // Tier-0: Lexicon (O(1) Karmaşıklık - Asla beklemez)
         for word in text.to_lowercase().split_whitespace() {
             let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
             if let Some(&score) = FAST_PATH_WORDS.get(clean) {
@@ -109,22 +115,28 @@ impl VQIntelligence {
             }
         }
 
-        // Tier-1: Neural with 4ms Timeout
+        // Tier-1: Neural with STRICT 4ms Timeout (Cancellation-Safe)
         let brain_clone = self.brain.clone();
-        let text_owned = text.to_string();
-        let ai_result = timeout(Duration::from_millis(4), async move {
-            brain_clone.predict(&text_owned).await
-        })
+
+        // FIX: C++ Blocking çağrısını Tokio Thread Havuzuna taşıyoruz ki Timeout işe yarasın
+        let ai_result = timeout(
+            Duration::from_millis(4),
+            tokio::task::spawn_blocking(move || brain_clone.predict_sync(&text)),
+        )
         .await;
 
         match ai_result {
-            Ok(Ok(score)) => (score, "TIER-1 (NEURAL)"),
-            Ok(Err(e)) => {
+            Ok(Ok(Ok(score))) => (score, "TIER-1 (NEURAL)"),
+            Ok(Ok(Err(e))) => {
                 error!("Neural Prediction Error: {}", e);
                 (0.0, "NEURAL-ERROR")
             }
+            Ok(Err(e)) => {
+                error!("Thread Spawn Error: {}", e);
+                (0.0, "THREAD-ERROR")
+            }
             Err(_) => {
-                warn!("⏳ [SLA-VIOLATION] AI took > 4ms for: {}", text);
+                warn!("⏳ [SLA-VIOLATION] AI took > 4ms! GRACEFUL DEGRADATION ACTIVATED.");
                 (0.0, "SLA-TIMEOUT")
             }
         }
@@ -151,7 +163,7 @@ fn extract_target_symbol(text: &str) -> Option<&'static str> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    info!("🧠 VQ-Intelligence v4.0: Starting Multi-Tier Brain (Resilient Mode)...");
+    info!("🧠 VQ-Intelligence v4.0: Starting Multi-Tier Brain (STRICT HFT MODE)...");
 
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
@@ -165,7 +177,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "/opt/models/tokenizer.json".to_string());
 
     let brain = Arc::new(NeuralBrain {
-        session: RwLock::new(Session::builder()?.commit_from_file(model_path)?),
+        // FIX: Session objesi std::sync::Mutex ile sarmalandı
+        session: Mutex::new(Session::builder()?.commit_from_file(model_path)?),
         tokenizer: Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!(e))?,
     });
 
@@ -179,7 +192,10 @@ async fn main() -> Result<()> {
             while let Some(msg) = sub.next().await {
                 if let Ok(news) = RawNewsEvent::decode(msg.payload) {
                     let start = Instant::now();
-                    let (score, method) = service_clone.process_full_stack(&news.headline).await;
+                    // FIX: String sahipliğini (ownership) alıyoruz
+                    let (score, method) = service_clone
+                        .process_full_stack(news.headline.clone())
+                        .await;
 
                     if let Some(symbol) = extract_target_symbol(&news.headline) {
                         if score.abs() > 0.05 {
