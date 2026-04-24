@@ -8,6 +8,7 @@ use hf_hub::api::sync::Api;
 use phf::phf_map;
 use prost::Message;
 use std::sync::Arc;
+use std::time::Instant;
 use tokenizers::Tokenizer;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{error, info, warn};
@@ -28,10 +29,10 @@ use sentinel_protos::intelligence::{AnalyzeTextRequest, AnalyzeTextResponse, Sem
 use sentinel_protos::market::RawNewsEvent;
 
 // ==============================================================================
-// 1. GERÇEK YAPAY ZEKA (DistilRoBERTa) - CANDLE HFT BACKEND
+// 1. TIER 1: TENSOR ENGINE (CANDLE)
 // ==============================================================================
 
-struct FinBertSlm {
+struct TensorEngine {
     bert: BertModel,
     classifier: Linear,
     tokenizer: Tokenizer,
@@ -40,20 +41,20 @@ struct FinBertSlm {
     neg_id: usize,
 }
 
-impl FinBertSlm {
+impl TensorEngine {
     fn load(device: &Device) -> Result<Self> {
-        // HFT ve Rust (Candle) ile en uyumlu, en hızlı model seçildi.
-        let repo_id = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis";
-        info!("⏳ [HF-HUB] {} ağırlıkları aranıyor...", repo_id);
+        let repo_id = "ahmedrachid/FinancialBERT-Sentiment-Analysis";
+        info!("⏳ [TIER-1] {} ağırlıkları aranıyor...", repo_id);
 
         let api = Api::new().context("HuggingFace API Error")?;
         let repo = api.model(repo_id.to_string());
 
-        // Hata fırlatmak yerine dosyaları dikkatlice çekiyoruz.
-        let tokenizer_filename = repo.get("tokenizer.json").context("Tokenizer bulunamadı")?;
+        let tokenizer_filename = repo
+            .get("tokenizer.json")
+            .context("Tokenizer.json bulunamadı")?;
         let weights_filename = repo
             .get("model.safetensors")
-            .context("Safetensors bulunamadı")?;
+            .context("model.safetensors bulunamadı")?;
         let config_filename = repo.get("config.json").context("Config bulunamadı")?;
 
         let config_str = std::fs::read_to_string(config_filename)?;
@@ -61,10 +62,8 @@ impl FinBertSlm {
         let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
         let hidden_size = config_json["hidden_size"].as_u64().unwrap_or(768) as usize;
 
-        // Dinamik Sınıf Eşleme (0, 1, 2)
         let mut pos_id = 2;
         let mut neg_id = 0;
-
         if let Some(id2label) = config_json["id2label"].as_object() {
             for (id_str, label_val) in id2label {
                 if let (Ok(idx), Some(label_str)) = (id_str.parse::<usize>(), label_val.as_str()) {
@@ -79,7 +78,6 @@ impl FinBertSlm {
         }
 
         let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(|e| anyhow::anyhow!(e))?;
-
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_filename], DType::F32, device)
                 .context("Safetensors mmap hatası")?
@@ -89,10 +87,7 @@ impl FinBertSlm {
         let classifier = candle_nn::linear(hidden_size, 3, vb.pp("classifier"))
             .context("Classifier yüklenemedi")?;
 
-        info!(
-            "✅ [CANDLE] Model başarıyla yüklendi. (Pos: {}, Neg: {})",
-            pos_id, neg_id
-        );
+        info!("✅ [TIER-1] Tensor Engine Başarıyla Yüklendi!");
 
         Ok(Self {
             bert,
@@ -116,7 +111,6 @@ impl FinBertSlm {
         }
 
         let token_type_ids = vec![0u32; token_ids.len()];
-
         let input_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
         let token_type_tensor =
             Tensor::new(token_type_ids.as_slice(), &self.device)?.unsqueeze(0)?;
@@ -136,79 +130,111 @@ impl FinBertSlm {
 }
 
 // ==============================================================================
-// 2. FALLBACK (YEDEK) LEXICON ENGINE
+// 2. TIER 0: ULTRA-FAST PATH LEXICON (Nanosecond Resolution)
 // ==============================================================================
 
-static FINANCIAL_LEXICON: phf::Map<&'static str, f64> = phf_map! {
+// HFT dünyasında eğer haberde "hack" veya "bankruptcy" geçiyorsa, BERT'i beklemeyiz.
+// Anında -1 basar ve işlemi gerçekleştiririz.
+static EXTREME_SIGNALS: phf::Map<&'static str, f64> = phf_map! {
+    "hack" => -1.0, "hacked" => -1.0, "exploit" => -1.0, "exploiter" => -1.0,
+    "bankruptcy" => -1.0, "bankrupt" => -1.0, "insolvent" => -1.0,
+    "sec" => -0.8, "lawsuit" => -0.9, "probe" => -0.8, "investigation" => -0.8,
+    "delist" => -1.0, "delisted" => -1.0, "arrest" => -1.0, "arrested" => -1.0,
+    "scam" => -1.0, "rugpull" => -1.0, "rug" => -1.0,
+    "approval" => 1.0, "approved" => 1.0, "partnership" => 0.8, "partners" => 0.8,
+};
+
+static STANDARD_LEXICON: phf::Map<&'static str, f64> = phf_map! {
     "bullish" => 0.8, "moon" => 0.9, "breakout" => 0.7, "surge" => 0.8, "surges" => 0.8,
-    "rally" => 0.7, "adoption" => 0.6, "inflows" => 0.7, "accumulate" => 0.7, "accumulation" => 0.7,
+    "rally" => 0.7, "adoption" => 0.6, "inflows" => 0.7, "accumulate" => 0.7,
     "bearish" => -0.8, "crash" => -0.9, "crashes" => -0.9, "dump" => -0.8, "dumps" => -0.8,
-    "resistance" => -0.5, "partnership" => 0.6, "partners" => 0.6, "lawsuit" => -0.9,
-    "hack" => -0.9, "hacked" => -0.9, "exploiter" => -0.8, "freeze" => -0.6, "freezes" => -0.6,
-    "slumps" => -0.7, "sec" => -0.5, "probe" => -0.6, "investigation" => -0.6,
+    "resistance" => -0.5, "slumps" => -0.7, "plunge" => -0.8, "plunges" => -0.8,
 };
 
 // ==============================================================================
-// 3. CORE AI YAPISI & ENTITY RECOGNITION
+// 3. MULTI-TIER ORCHESTRATOR
 // ==============================================================================
 
-pub struct NativeRustAI {
-    slm: Option<FinBertSlm>,
+pub struct VQIntelligenceCore {
+    tensor_engine: Option<TensorEngine>,
     device: Device,
 }
 
-impl Default for NativeRustAI {
+impl Default for VQIntelligenceCore {
     fn default() -> Self {
         Self::build()
     }
 }
 
-impl NativeRustAI {
+impl VQIntelligenceCore {
     pub fn build() -> Self {
         let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
         info!(
-            "🤖 VQ-Capital AI Motoru Başlatılıyor. Donanım: {:?}",
+            "🤖 VQ-Capital Multi-Tier Engine Başlatılıyor. Donanım: {:?}",
             device
         );
 
-        // Hata durumunda sistemi çökertmez.
-        let slm = match FinBertSlm::load(&device) {
+        let tensor_engine = match TensorEngine::load(&device) {
             Ok(model) => Some(model),
             Err(e) => {
-                error!("🚨 HF-Hub İndirme/Yükleme Hatası (Ağ veya Format): {}", e);
-                warn!(
-                    "⚠️ HFT Kesintiye Uğramayacak! Sistem 'Lexicon (Sözlük)' modunda devam ediyor."
-                );
+                error!("🚨 [AĞ/CDN HATASI] HuggingFace bağlantısı başarısız: {}", e);
+                warn!("⚠️ TIER-1 Devre Dışı! Sadece TIER-0 (O(1) Nanosecond Lexicon) çalışacak.");
                 None
             }
         };
 
-        Self { slm, device }
+        Self {
+            tensor_engine,
+            device,
+        }
     }
 
-    pub fn analyze(&self, text: &str) -> f64 {
-        if let Some(ref model) = self.slm {
-            match model.predict(text) {
-                Ok(ml_score) => return ml_score,
-                Err(e) => warn!("⚠️ NLP Inference Hatası: {}", e),
+    pub fn analyze(&self, text: &str) -> (f64, &'static str) {
+        let start_time = Instant::now();
+        let lower_text = text.to_lowercase();
+
+        // --- ⚡ TIER 0: EARLY EXIT (EXTREME FAST PATH) ---
+        for word in lower_text.split_whitespace() {
+            let clean_word = word.trim_matches(|c: char| !c.is_alphanumeric());
+            if let Some(&score) = EXTREME_SIGNALS.get(clean_word) {
+                // Ölümcül veya harika bir haber. Tensor hesaplamasına gerek yok.
+                return (score, "TIER-0 (EXTREME)");
             }
         }
 
+        // --- 🧠 TIER 1: TENSOR INFERENCE ---
+        if let Some(ref model) = self.tensor_engine {
+            match model.predict(text) {
+                Ok(ml_score) => {
+                    let elapsed = start_time.elapsed().as_micros();
+                    // SLA Watchdog: Eğer hesaplama çok uzun sürerse (Örn. CPU darboğazı) uyar
+                    if elapsed > 10000 {
+                        warn!("⚠️ [SLA İHLALİ] Tensor süresi çok uzun: {}µs", elapsed);
+                    }
+                    return (ml_score, "TIER-1 (TENSOR)");
+                }
+                Err(e) => warn!("⚠️ Tensor Hatası: {}. Tier-0'a Düşülüyor.", e),
+            }
+        }
+
+        // --- 🛡️ TIER 0: GRACEFUL DEGRADATION (STANDARD LEXICON) ---
         let mut lexicon_score = 0.0;
         let mut match_count = 0;
-
-        for word in text.to_lowercase().split_whitespace() {
+        for word in lower_text.split_whitespace() {
             let clean_word = word.trim_matches(|c: char| !c.is_alphanumeric());
-            if let Some(&score) = FINANCIAL_LEXICON.get(clean_word) {
+            if let Some(&score) = STANDARD_LEXICON.get(clean_word) {
                 lexicon_score += score;
                 match_count += 1;
             }
         }
-        if match_count > 0 {
+
+        let final_score = if match_count > 0 {
             (lexicon_score / match_count as f64).clamp(-1.0, 1.0)
         } else {
             0.0
-        }
+        };
+
+        (final_score, "TIER-0 (LEXICON)")
     }
 
     pub fn extract_symbol(text_upper: &str) -> Option<&'static str> {
@@ -241,12 +267,12 @@ impl NativeRustAI {
 }
 
 #[tonic::async_trait]
-impl SentimentAnalyzerService for NativeRustAI {
+impl SentimentAnalyzerService for VQIntelligenceCore {
     async fn analyze_text(
         &self,
         request: Request<AnalyzeTextRequest>,
     ) -> Result<Response<AnalyzeTextResponse>, Status> {
-        let final_score = self.analyze(&request.into_inner().text);
+        let (final_score, _) = self.analyze(&request.into_inner().text);
         Ok(Response::new(AnalyzeTextResponse { score: final_score }))
     }
 }
@@ -265,7 +291,7 @@ async fn main() -> Result<()> {
         .await
         .context("CRITICAL: NATS bağlanılamadı")?;
 
-    let ai_service = tokio::task::spawn_blocking(NativeRustAI::build)
+    let ai_service = tokio::task::spawn_blocking(VQIntelligenceCore::build)
         .await
         .context("AI Builder Panic Hatası")?;
 
@@ -275,18 +301,20 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         if let Ok(mut sub) = nats_client.subscribe("news.raw.>").await {
-            info!("📡 AI Tensor Worker: Haber Akışına Bağlandı.");
+            info!("📡 Multi-Tier AI Worker: Haber Akışına Bağlandı.");
 
             while let Some(msg) = sub.next().await {
                 if let Ok(raw_news) = RawNewsEvent::decode(msg.payload) {
                     let text_upper = raw_news.headline.to_uppercase();
 
-                    let symbol = match NativeRustAI::extract_symbol(&text_upper) {
+                    let symbol = match VQIntelligenceCore::extract_symbol(&text_upper) {
                         Some(s) => s,
                         None => continue,
                     };
 
-                    let score = ai_arc.analyze(&raw_news.headline);
+                    let start_eval = Instant::now();
+                    let (score, tier_used) = ai_arc.analyze(&raw_news.headline);
+                    let eval_time = start_eval.elapsed().as_micros();
 
                     if score.abs() < 0.05 {
                         continue;
@@ -310,9 +338,15 @@ async fn main() -> Result<()> {
                         } else {
                             "🔴 AYI"
                         };
+
                         info!(
-                            "🧠 [NLP] {} {} (Skor: {:.2}) | {}",
-                            symbol, direction, score, vector.original_headline
+                            "⚡ [{}] {} {} (Skor: {:.2}, Hız: {}µs) | {}",
+                            tier_used,
+                            symbol,
+                            direction,
+                            score,
+                            eval_time,
+                            vector.original_headline
                         );
                     }
                 }
@@ -323,8 +357,8 @@ async fn main() -> Result<()> {
     let addr = "0.0.0.0:50051".parse()?;
     info!("⚡ Sentinel-Intelligence gRPC dinliyor: {}", addr);
 
-    let service_clone = NativeRustAI {
-        slm: None,
+    let service_clone = VQIntelligenceCore {
+        tensor_engine: None,
         device: grpc_ai.device.clone(),
     };
 
