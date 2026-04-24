@@ -1,6 +1,6 @@
 // ========== DOSYA: sentinel-intelligence/src/main.rs ==========
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, IndexOp, Module, Tensor}; // <-- EKLENDİ: Module
+use candle_core::{DType, Device, IndexOp, Module, Tensor};
 use candle_nn::{Linear, VarBuilder};
 use candle_transformers::models::bert::{BertModel, Config};
 use futures_util::StreamExt;
@@ -28,7 +28,7 @@ use sentinel_protos::intelligence::{AnalyzeTextRequest, AnalyzeTextResponse, Sem
 use sentinel_protos::market::RawNewsEvent;
 
 // ==============================================================================
-// 1. GERÇEK YAPAY ZEKA (FinBERT) - CANDLE GPU BACKEND
+// 1. GERÇEK YAPAY ZEKA (FinancialBERT) - CANDLE GPU/CPU BACKEND
 // ==============================================================================
 
 struct FinBertSlm {
@@ -36,28 +36,51 @@ struct FinBertSlm {
     classifier: Linear,
     tokenizer: Tokenizer,
     device: Device,
+    pos_id: usize,
+    neg_id: usize,
 }
 
 impl FinBertSlm {
     fn load(device: &Device) -> Result<Self> {
-        info!("⏳ [HF-HUB] ProsusAI/finbert ağırlıkları kontrol ediliyor...");
+        let repo_id = "ahmedrachid/FinancialBERT-Sentiment-Analysis";
+        info!("⏳ [HF-HUB] {} ağırlıkları kontrol ediliyor...", repo_id);
 
         let api = Api::new().context("HuggingFace API başlatılamadı")?;
-        let repo = api.model("ProsusAI/finbert".to_string());
+        let repo = api.model(repo_id.to_string());
 
-        let tokenizer_filename = repo.get("tokenizer.json").context("Tokenizer eksik")?;
+        let tokenizer_filename = repo.get("tokenizer.json").context("Tokenizer.json eksik")?;
         let weights_filename = repo
             .get("model.safetensors")
-            .context("Model ağırlıkları eksik")?;
-        let config_filename = repo.get("config.json").context("Config eksik")?;
+            .context("model.safetensors eksik")?;
+        let config_filename = repo.get("config.json").context("Config.json eksik")?;
 
         let config_str = std::fs::read_to_string(config_filename)?;
         let config: Config = serde_json::from_str(&config_str)?;
 
-        // DÜZELTME: candle_transformers::models::bert::Config içindeki
-        // alanlar crate'in dışına kapalı (private) olduğu için, JSON üzerinden boyut okuması yapıyoruz.
         let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
         let hidden_size = config_json["hidden_size"].as_u64().unwrap_or(768) as usize;
+
+        // DİNAMİK SINIF EŞLEME (Dynamic Label Mapping)
+        let mut pos_id = 2; // Varsayılan
+        let mut neg_id = 0; // Varsayılan
+
+        if let Some(id2label) = config_json["id2label"].as_object() {
+            for (id_str, label_val) in id2label {
+                if let (Ok(idx), Some(label_str)) = (id_str.parse::<usize>(), label_val.as_str()) {
+                    let lower = label_str.to_lowercase();
+                    if lower.contains("positive") {
+                        pos_id = idx;
+                    } else if lower.contains("negative") {
+                        neg_id = idx;
+                    }
+                }
+            }
+        }
+
+        info!(
+            "🧠 Dinamik NLP Eşleşmesi -> Pozitif ID: {}, Negatif ID: {}",
+            pos_id, neg_id
+        );
 
         let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -71,13 +94,15 @@ impl FinBertSlm {
         let classifier = candle_nn::linear(hidden_size, 3, vb.pp("classifier"))
             .context("Classifier Katmanı yüklenemedi")?;
 
-        info!("✅ [CANDLE] FinBERT Başarıyla GPU/CPU Belleğine Yüklendi!");
+        info!("✅ [CANDLE] FinancialBERT Başarıyla GPU/CPU Belleğine Yüklendi!");
 
         Ok(Self {
             bert,
             classifier,
             tokenizer,
             device: device.clone(),
+            pos_id,
+            neg_id,
         })
     }
 
@@ -105,12 +130,12 @@ impl FinBertSlm {
         let cls_embedding = embeddings.i((.., 0, ..))?;
         let logits = self.classifier.forward(&cls_embedding)?;
 
-        // FinBERT Sınıfları: 0 -> Pozitif, 1 -> Negatif, 2 -> Nötr
         let probs = candle_nn::ops::softmax(&logits, candle_core::D::Minus1)?;
         let probs_vec = probs.squeeze(0)?.to_vec1::<f32>()?;
 
-        let pos = probs_vec[0] as f64;
-        let neg = probs_vec[1] as f64;
+        // Dinamik ID'lere göre skorları al
+        let pos = probs_vec[self.pos_id] as f64;
+        let neg = probs_vec[self.neg_id] as f64;
 
         // VQ-Capital Formatına Dönüştür: -1.0 (Ayı) ile +1.0 (Boğa)
         Ok(pos - neg)
@@ -150,14 +175,10 @@ impl NativeRustAI {
         let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
         info!("🤖 VQ-Capital AI Motoru Başlatılıyor. Hedef: {:?}", device);
 
-        // Hata durumunda sistemi çökertmez (No Unwrap). Sadece Fallback yapar.
         let slm = match FinBertSlm::load(&device) {
             Ok(model) => Some(model),
             Err(e) => {
-                error!(
-                    "🚨 Kırmızı Alarm: FinBERT Modeli Yüklenemedi! Neden: {:?}",
-                    e
-                );
+                error!("🚨 Kırmızı Alarm: SLM Modeli Yüklenemedi! Neden: {:?}", e);
                 warn!(
                     "⚠️ Sistem 'İlkel Sözlük (Lexicon)' Moduna düşürülerek çalışmaya devam edecek!"
                 );
@@ -169,15 +190,13 @@ impl NativeRustAI {
     }
 
     pub fn analyze(&self, text: &str) -> f64 {
-        // 1. Önce Güçlü FinBERT Modelini Dene
         if let Some(ref model) = self.slm {
             match model.predict(text) {
                 Ok(ml_score) => return ml_score,
-                Err(e) => warn!("⚠️ FinBERT Çıkarım Hatası (Fallback Yapılıyor): {}", e),
+                Err(e) => warn!("⚠️ NLP Çıkarım Hatası (Fallback Yapılıyor): {}", e),
             }
         }
 
-        // 2. Çökerse İlkel Lexicon'a Dön
         let mut lexicon_score = 0.0;
         let mut match_count = 0;
 
@@ -195,7 +214,6 @@ impl NativeRustAI {
         }
     }
 
-    // Gerçek Dünya Varlık İsmi Tanıma (NER)
     pub fn extract_symbol(text_upper: &str) -> Option<&'static str> {
         if text_upper.contains("BITCOIN")
             || text_upper.contains("BTC ")
@@ -250,8 +268,6 @@ async fn main() -> Result<()> {
         .await
         .context("CRITICAL: NATS bağlanılamadı")?;
 
-    // Model yükleme işlemi bloklayıcı (Senkron) olduğundan, tokio'nun kendi yapısı
-    // içinde engellememesi için tokio block_in_place kullanıyoruz.
     let ai_service = tokio::task::spawn_blocking(NativeRustAI::build)
         .await
         .context("AI Builder Panic Hatası")?;
@@ -300,7 +316,7 @@ async fn main() -> Result<()> {
                             "🔴 AYI"
                         };
                         info!(
-                            "🧠 [FinBERT-CUDA] {} {} (Skor: {:.2}) | {}",
+                            "🧠 [NLP-CUDA] {} {} (Skor: {:.2}) | {}",
                             symbol, direction, score, vector.original_headline
                         );
                     }
@@ -314,11 +330,10 @@ async fn main() -> Result<()> {
     let addr = "0.0.0.0:50051".parse()?;
     info!("⚡ Sentinel-Intelligence gRPC dinliyor: {}", addr);
 
-    // Klone as service metodu
     let service_clone = NativeRustAI {
         slm: None,
         device: grpc_ai.device.clone(),
-    }; // Shallow clone for grpc since main loop does the heavy lifting
+    };
 
     Server::builder()
         .add_service(SentimentAnalyzerServiceServer::new(service_clone))
