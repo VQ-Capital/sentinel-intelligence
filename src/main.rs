@@ -43,11 +43,27 @@ struct TensorEngine {
 
 impl TensorEngine {
     fn load(device: &Device) -> Result<Self> {
-        let repo_id = "ahmedrachid/FinancialBERT-Sentiment-Analysis";
-        info!("⏳ [TIER-1] {} ağırlıkları aranıyor...", repo_id);
+        // DİNAMİK YAPILANDIRMA (Hard-code bitti)
+        let repo_id = std::env::var("MODEL_REPO_ID").unwrap_or_else(|_| {
+            "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis".to_string()
+        });
+
+        let pos_id: usize = std::env::var("MODEL_POS_ID")
+            .unwrap_or_else(|_| "2".to_string())
+            .parse()
+            .unwrap_or(2);
+        let neg_id: usize = std::env::var("MODEL_NEG_ID")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .unwrap_or(0);
+
+        info!(
+            "⏳ [TIER-1] ENV üzerinden '{}' ağırlıkları aranıyor...",
+            repo_id
+        );
 
         let api = Api::new().context("HuggingFace API Error")?;
-        let repo = api.model(repo_id.to_string());
+        let repo = api.model(repo_id.clone());
 
         let tokenizer_filename = repo
             .get("tokenizer.json")
@@ -62,21 +78,6 @@ impl TensorEngine {
         let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
         let hidden_size = config_json["hidden_size"].as_u64().unwrap_or(768) as usize;
 
-        let mut pos_id = 2;
-        let mut neg_id = 0;
-        if let Some(id2label) = config_json["id2label"].as_object() {
-            for (id_str, label_val) in id2label {
-                if let (Ok(idx), Some(label_str)) = (id_str.parse::<usize>(), label_val.as_str()) {
-                    let lower = label_str.to_lowercase();
-                    if lower.contains("positive") {
-                        pos_id = idx;
-                    } else if lower.contains("negative") {
-                        neg_id = idx;
-                    }
-                }
-            }
-        }
-
         let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(|e| anyhow::anyhow!(e))?;
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_filename], DType::F32, device)
@@ -87,7 +88,10 @@ impl TensorEngine {
         let classifier = candle_nn::linear(hidden_size, 3, vb.pp("classifier"))
             .context("Classifier yüklenemedi")?;
 
-        info!("✅ [TIER-1] Tensor Engine Başarıyla Yüklendi!");
+        info!(
+            "✅ [TIER-1] Tensor Engine Başarıyla Yüklendi! Model: {} | Pos ID: {} | Neg ID: {}",
+            repo_id, pos_id, neg_id
+        );
 
         Ok(Self {
             bert,
@@ -122,8 +126,9 @@ impl TensorEngine {
         let probs = candle_nn::ops::softmax(&logits, candle_core::D::Minus1)?;
         let probs_vec = probs.squeeze(0)?.to_vec1::<f32>()?;
 
-        let pos = probs_vec[self.pos_id] as f64;
-        let neg = probs_vec[self.neg_id] as f64;
+        // Güvenli Erişim
+        let pos = *probs_vec.get(self.pos_id).unwrap_or(&0.0) as f64;
+        let neg = *probs_vec.get(self.neg_id).unwrap_or(&0.0) as f64;
 
         Ok(pos - neg)
     }
@@ -133,8 +138,6 @@ impl TensorEngine {
 // 2. TIER 0: ULTRA-FAST PATH LEXICON (Nanosecond Resolution)
 // ==============================================================================
 
-// HFT dünyasında eğer haberde "hack" veya "bankruptcy" geçiyorsa, BERT'i beklemeyiz.
-// Anında -1 basar ve işlemi gerçekleştiririz.
 static EXTREME_SIGNALS: phf::Map<&'static str, f64> = phf_map! {
     "hack" => -1.0, "hacked" => -1.0, "exploit" => -1.0, "exploiter" => -1.0,
     "bankruptcy" => -1.0, "bankrupt" => -1.0, "insolvent" => -1.0,
@@ -177,7 +180,7 @@ impl VQIntelligenceCore {
         let tensor_engine = match TensorEngine::load(&device) {
             Ok(model) => Some(model),
             Err(e) => {
-                error!("🚨 [AĞ/CDN HATASI] HuggingFace bağlantısı başarısız: {}", e);
+                error!("🚨 [TENSOR HATASI] Model yüklenemedi: {}", e);
                 warn!("⚠️ TIER-1 Devre Dışı! Sadece TIER-0 (O(1) Nanosecond Lexicon) çalışacak.");
                 None
             }
@@ -193,21 +196,17 @@ impl VQIntelligenceCore {
         let start_time = Instant::now();
         let lower_text = text.to_lowercase();
 
-        // --- ⚡ TIER 0: EARLY EXIT (EXTREME FAST PATH) ---
         for word in lower_text.split_whitespace() {
             let clean_word = word.trim_matches(|c: char| !c.is_alphanumeric());
             if let Some(&score) = EXTREME_SIGNALS.get(clean_word) {
-                // Ölümcül veya harika bir haber. Tensor hesaplamasına gerek yok.
                 return (score, "TIER-0 (EXTREME)");
             }
         }
 
-        // --- 🧠 TIER 1: TENSOR INFERENCE ---
         if let Some(ref model) = self.tensor_engine {
             match model.predict(text) {
                 Ok(ml_score) => {
                     let elapsed = start_time.elapsed().as_micros();
-                    // SLA Watchdog: Eğer hesaplama çok uzun sürerse (Örn. CPU darboğazı) uyar
                     if elapsed > 10000 {
                         warn!("⚠️ [SLA İHLALİ] Tensor süresi çok uzun: {}µs", elapsed);
                     }
@@ -217,7 +216,6 @@ impl VQIntelligenceCore {
             }
         }
 
-        // --- 🛡️ TIER 0: GRACEFUL DEGRADATION (STANDARD LEXICON) ---
         let mut lexicon_score = 0.0;
         let mut match_count = 0;
         for word in lower_text.split_whitespace() {
