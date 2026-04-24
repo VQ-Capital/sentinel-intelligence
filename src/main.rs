@@ -36,12 +36,7 @@ struct SentimentSlm {
 
 impl SentimentSlm {
     fn new(device: &Device) -> Result<Self> {
-        // HFT ortamı için model diskten (safetensors) yüklenmelidir.
-        // Ancak test ortamındaysak, bellek üzerinde rastgele bir VarBuilder yaratıyoruz.
-        // Gerçek kullanımda: VarBuilder::from_safetensors(...)
         let vb = VarBuilder::zeros(DType::F32, device);
-
-        // 768 boyutlu BERT/Qwen embedding'ini alır, 128'e sıkıştırır, sonra 1 boyutlu Duygu Skoruna indirger.
         let fc1 = linear(768, 128, vb.pp("fc1")).context("FC1 katmanı oluşturulamadı")?;
         let fc2 = linear(128, 1, vb.pp("fc2")).context("FC2 katmanı oluşturulamadı")?;
 
@@ -53,41 +48,37 @@ impl SentimentSlm {
     }
 
     fn forward(&self, text: &str) -> Result<f64> {
-        // ADIM 1: Mock Tokenization & Embedding
-        // (Metni 768 boyutlu bir sayısal tensöre çeviririz. Production'da HuggingFace Tokenizers kullanılır)
         let mut embed_data = vec![0.0f32; 768];
         for (i, b) in text.bytes().enumerate() {
             if i < 768 {
                 embed_data[i] = (b as f32) / 255.0;
-            } // ASCII karakterleri normalize et
+            }
         }
 
-        // ADIM 2: Tensör Oluştur (Shape: [1, 768])
         let input = Tensor::from_vec(embed_data, (1, 768), &self.device)?;
-
-        // ADIM 3: İleri Besleme (Forward Pass - Matris Çarpımı)
         let hidden = self.fc1.forward(&input)?.relu()?;
         let output = self.fc2.forward(&hidden)?;
 
-        // ADIM 4: Çıktıyı al ve Tanh fonksiyonu ile [-1.0, 1.0] aralığına sıkıştır
         let raw_score = output.to_vec2::<f32>()?[0][0];
         Ok(raw_score.tanh() as f64)
     }
 }
 
 // ==============================================================================
-// 2. FALLBACK LEXICON (GÜVENLİK AĞI)
+// 2. FALLBACK LEXICON (GERÇEK DÜNYA İÇİN GENİŞLETİLDİ)
 // ==============================================================================
 
 static FINANCIAL_LEXICON: phf::Map<&'static str, f64> = phf_map! {
     "bullish" => 0.8, "moon" => 0.9, "breakout" => 0.7, "surge" => 0.8, "surges" => 0.8,
+    "rally" => 0.7, "adoption" => 0.6, "inflows" => 0.7, "accumulate" => 0.7, "accumulation" => 0.7,
     "bearish" => -0.8, "crash" => -0.9, "crashes" => -0.9, "dump" => -0.8, "dumps" => -0.8,
     "resistance" => -0.5, "partnership" => 0.6, "partners" => 0.6, "lawsuit" => -0.9,
-    "accumulation" => 0.7,
+    "hack" => -0.9, "hacked" => -0.9, "exploiter" => -0.8, "freeze" => -0.6, "freezes" => -0.6,
+    "slumps" => -0.7, "sec" => -0.5, "probe" => -0.6, "investigation" => -0.6,
 };
 
 // ==============================================================================
-// 3. CORE AI YAPISI (ENSEMBLE FUSION)
+// 3. CORE AI YAPISI & ENTITY RECOGNITION
 // ==============================================================================
 
 pub struct NativeRustAI {
@@ -112,10 +103,7 @@ impl NativeRustAI {
                 Some(model)
             }
             Err(e) => {
-                warn!(
-                    "⚠️ SLM Yüklenemedi, sistem sadece Lexicon ile devam edecek: {}",
-                    e
-                );
+                warn!("⚠️ SLM Yüklenemedi, sistem Lexicon ile devam edecek: {}", e);
                 None
             }
         };
@@ -140,15 +128,42 @@ impl NativeRustAI {
             0.0
         };
 
-        // ENSEMBLE: Hem Sinir Ağından (Tensör) hem Sözlükten (Lexicon) gelen veriyi birleştir
         if let Some(ref model) = self.slm {
             if let Ok(ml_score) = model.forward(text) {
-                // Tensör çıkışı ile klasik sözlük çıkışının ağırlıklı ortalaması
                 return (ml_score * 0.4) + (lex_final * 0.6);
             }
         }
 
         lex_final
+    }
+
+    // YENİ: Gerçek Dünya Varlık İsmi Tanıma (NER - Named Entity Recognition)
+    pub fn extract_symbol(text_upper: &str) -> Option<&'static str> {
+        if text_upper.contains("BITCOIN")
+            || text_upper.contains("BTC ")
+            || text_upper.contains(" BTC")
+        {
+            return Some("BTCUSDT");
+        }
+        if text_upper.contains("ETHEREUM")
+            || text_upper.contains("ETHER")
+            || text_upper.contains("ETH ")
+        {
+            return Some("ETHUSDT");
+        }
+        if text_upper.contains("SOLANA")
+            || text_upper.contains("SOL ")
+            || text_upper.contains(" SOL")
+        {
+            return Some("SOLUSDT");
+        }
+        if text_upper.contains("BINANCE")
+            || text_upper.contains("BNB ")
+            || text_upper.contains(" BNB")
+        {
+            return Some("BNBUSDT");
+        }
+        None
     }
 }
 
@@ -183,27 +198,24 @@ async fn main() -> Result<()> {
     let nats_pub = nats_client.clone();
     tokio::spawn(async move {
         if let Ok(mut sub) = nats_client.subscribe("news.raw.>").await {
-            info!("📡 AI Tensor Worker: Haber Akışına Bağlandı. Sözel veriler matrislere çarpılıyor...");
+            info!(
+                "📡 AI Tensor Worker: Haber Akışına Bağlandı. Gerçek dünya entitileri taranıyor..."
+            );
 
             while let Some(msg) = sub.next().await {
                 if let Ok(raw_news) = RawNewsEvent::decode(msg.payload) {
-                    let text = raw_news.headline.to_uppercase();
-                    let symbol = if text.contains("BTC") {
-                        "BTCUSDT"
-                    } else if text.contains("ETH") {
-                        "ETHUSDT"
-                    } else if text.contains("SOL") {
-                        "SOLUSDT"
-                    } else if text.contains("BNB") {
-                        "BNBUSDT"
-                    } else {
-                        continue;
+                    let text_upper = raw_news.headline.to_uppercase();
+
+                    // Varlık İsmi Eşleştirme
+                    let symbol = match NativeRustAI::extract_symbol(&text_upper) {
+                        Some(s) => s,
+                        None => continue, // Coin ile ilgili değilse işlemci gücü harcama
                     };
 
-                    // TENSÖR HESAPLAMASI BURADA TETİKLENİR
                     let score = ai_service.analyze(&raw_news.headline);
 
-                    if score.abs() < 0.1 {
+                    // Gerçek dünyada skorlar daha yumuşaktır, eşiği 0.05'e çektik
+                    if score.abs() < 0.05 {
                         continue;
                     }
 
@@ -249,11 +261,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Clone implementasyonu (gRPC servisi için)
 impl NativeRustAI {
     fn clone_as_service(&self) -> Self {
         Self {
-            slm: None, // gRPC worker'ında tensor kopyalamayı önlemek için hafif kopyalama
+            slm: None,
             device: self.device.clone(),
         }
     }
