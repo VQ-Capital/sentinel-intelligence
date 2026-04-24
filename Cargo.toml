@@ -1,7 +1,7 @@
 # ========== DOSYA: sentinel-intelligence/Cargo.toml ==========
 [package]
 name = "sentinel-intelligence"
-version = "0.5.0"
+version = "0.6.6"
 edition = "2021"
 
 [dependencies]
@@ -13,16 +13,11 @@ tracing-subscriber = "0.3"
 anyhow = "1.0"
 phf = { version = "0.11", features = ["macros"] }
 
-# Native Rust Machine Learning (GPU)
-candle-core = "0.4.1"
-candle-nn = "0.4.1"
-candle-transformers = "0.4.1"
+# Native Rust HFT Machine Learning (ONNX) - ndarray silindi
+ort = { version = "2.0.0-rc.9" } 
 tokenizers = { version = "0.15", default-features = false, features = ["onig"] }
-hf-hub = "0.3"
-half = "=2.3.1"
-rand = "=0.8.5"
 
-# Asenkron İletişim
+# IPC & Utils
 async-nats = "0.34"
 futures-util = "0.3"
 chrono = "0.4"

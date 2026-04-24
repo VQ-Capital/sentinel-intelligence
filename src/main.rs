@@ -1,15 +1,15 @@
 // ========== DOSYA: sentinel-intelligence/src/main.rs ==========
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, IndexOp, Module, Tensor};
-use candle_nn::{Linear, VarBuilder};
-use candle_transformers::models::bert::{BertModel, Config};
 use futures_util::StreamExt;
-use hf_hub::api::sync::Api;
+use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::value::Value;
 use phf::phf_map;
 use prost::Message;
 use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::Tokenizer;
+use tokio::sync::RwLock;
+use tokio::time::{timeout, Duration};
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{error, info, warn};
 
@@ -29,113 +29,116 @@ use sentinel_protos::intelligence::{AnalyzeTextRequest, AnalyzeTextResponse, Sem
 use sentinel_protos::market::RawNewsEvent;
 
 // ==============================================================================
-// 1. TIER 1: TENSOR ENGINE (CANDLE)
+// 1. TIER 1: ONNX TENSOR ENGINE (C++ / RUST ZERO-LATENCY BINDING)
 // ==============================================================================
 
-struct TensorEngine {
-    bert: BertModel,
-    classifier: Linear,
+struct OnnxEngine {
+    session: RwLock<Session>,
     tokenizer: Tokenizer,
-    device: Device,
     pos_id: usize,
     neg_id: usize,
 }
 
-impl TensorEngine {
-    fn load(device: &Device) -> Result<Self> {
-        // DİNAMİK YAPILANDIRMA (Hard-code bitti)
-        let repo_id = std::env::var("MODEL_REPO_ID").unwrap_or_else(|_| {
-            "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis".to_string()
-        });
+impl OnnxEngine {
+    fn load() -> Result<Self> {
+        let _ = ort::init().with_name("vq_capital_onnx").commit();
 
-        let pos_id: usize = std::env::var("MODEL_POS_ID")
-            .unwrap_or_else(|_| "2".to_string())
-            .parse()
-            .unwrap_or(2);
-        let neg_id: usize = std::env::var("MODEL_NEG_ID")
-            .unwrap_or_else(|_| "0".to_string())
-            .parse()
-            .unwrap_or(0);
+        let model_path =
+            std::env::var("MODEL_PATH").unwrap_or_else(|_| "/opt/models/model.onnx".to_string());
+        let tokenizer_path = std::env::var("TOKENIZER_PATH")
+            .unwrap_or_else(|_| "/opt/models/tokenizer.json".to_string());
 
         info!(
-            "⏳ [TIER-1] ENV üzerinden '{}' ağırlıkları aranıyor...",
-            repo_id
+            "⏳ [TIER-1] ONNX Modeli yükleniyor (Local Baked): {}",
+            model_path
         );
 
-        let api = Api::new().context("HuggingFace API Error")?;
-        let repo = api.model(repo_id.clone());
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!(e))?;
 
-        let tokenizer_filename = repo
-            .get("tokenizer.json")
-            .context("Tokenizer.json bulunamadı")?;
-        let weights_filename = repo
-            .get("model.safetensors")
-            .context("model.safetensors bulunamadı")?;
-        let config_filename = repo.get("config.json").context("Config bulunamadı")?;
+        let session = Session::builder()
+            .map_err(|e| anyhow::anyhow!("Session Builder Error: {}", e))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("Optimization Error: {}", e))?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow::anyhow!("Thread Config Error: {}", e))?
+            .commit_from_file(&model_path)
+            .map_err(|e| anyhow::anyhow!("Model Load Error: {}", e))?;
 
-        let config_str = std::fs::read_to_string(config_filename)?;
-        let config: Config = serde_json::from_str(&config_str)?;
-        let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
-        let hidden_size = config_json["hidden_size"].as_u64().unwrap_or(768) as usize;
+        let pos_id = 2;
+        let neg_id = 0;
 
-        let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(|e| anyhow::anyhow!(e))?;
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_filename], DType::F32, device)
-                .context("Safetensors mmap hatası")?
-        };
-
-        let bert = BertModel::load(vb.clone(), &config).context("Bert Modeli yüklenemedi")?;
-        let classifier = candle_nn::linear(hidden_size, 3, vb.pp("classifier"))
-            .context("Classifier yüklenemedi")?;
-
-        info!(
-            "✅ [TIER-1] Tensor Engine Başarıyla Yüklendi! Model: {} | Pos ID: {} | Neg ID: {}",
-            repo_id, pos_id, neg_id
-        );
+        info!("✅ [TIER-1] ONNX Tensor Engine Başarıyla Yüklendi!");
 
         Ok(Self {
-            bert,
-            classifier,
+            session: RwLock::new(session),
             tokenizer,
-            device: device.clone(),
             pos_id,
             neg_id,
         })
     }
 
-    fn predict(&self, text: &str) -> Result<f64> {
+    // FIX: &String yerine &str (HFT Best Practice)
+    async fn predict(&self, text: &str) -> Result<f64> {
         let tokens = self
             .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let mut token_ids = tokens.get_ids();
+        let token_ids = tokens.get_ids();
+        let seq_len = std::cmp::min(token_ids.len(), 128);
 
-        if token_ids.len() > 128 {
-            token_ids = &token_ids[..128];
+        let token_ids_i64: Vec<i64> = token_ids[..seq_len].iter().map(|&x| x as i64).collect();
+        let attention_mask_i64: Vec<i64> = vec![1i64; seq_len];
+        let token_type_ids_i64: Vec<i64> = vec![0i64; seq_len];
+
+        let shape = [1_usize, seq_len];
+
+        let input_ids_val = Value::from_array((shape, token_ids_i64))
+            .map_err(|e| anyhow::anyhow!("Input IDs Tensor Error: {}", e))?;
+        let attention_mask_val = Value::from_array((shape, attention_mask_i64))
+            .map_err(|e| anyhow::anyhow!("Mask Tensor Error: {}", e))?;
+        let token_type_ids_val = Value::from_array((shape, token_type_ids_i64))
+            .map_err(|e| anyhow::anyhow!("Token Type Tensor Error: {}", e))?;
+
+        let inputs_vec = ort::inputs![
+            "input_ids" => input_ids_val,
+            "attention_mask" => attention_mask_val,
+            "token_type_ids" => token_type_ids_val,
+        ];
+
+        let mut session_guard = self.session.write().await;
+        let outputs = session_guard
+            .run(inputs_vec)
+            .map_err(|e| anyhow::anyhow!("ONNX Runtime Execution Error: {}", e))?;
+
+        let extracted = outputs["logits"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow::anyhow!("Logits Extraction Error: {}", e))?;
+
+        let logits_slice = extracted.1;
+
+        if logits_slice.len() >= 3 {
+            let neg_logit = logits_slice[self.neg_id];
+            let pos_logit = logits_slice[self.pos_id];
+            let neutral_logit = logits_slice[1];
+
+            let max_val = neg_logit.max(pos_logit).max(neutral_logit);
+            let sum_exp = (neg_logit - max_val).exp()
+                + (pos_logit - max_val).exp()
+                + (neutral_logit - max_val).exp();
+            let pos_prob = (pos_logit - max_val).exp() / sum_exp;
+            let neg_prob = (neg_logit - max_val).exp() / sum_exp;
+
+            Ok((pos_prob - neg_prob) as f64)
+        } else {
+            Err(anyhow::anyhow!(
+                "ONNX Model çıkışı beklenenden farklı boyutta!"
+            ))
         }
-
-        let token_type_ids = vec![0u32; token_ids.len()];
-        let input_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
-        let token_type_tensor =
-            Tensor::new(token_type_ids.as_slice(), &self.device)?.unsqueeze(0)?;
-
-        let embeddings = self.bert.forward(&input_tensor, &token_type_tensor)?;
-        let cls_embedding = embeddings.i((.., 0, ..))?;
-        let logits = self.classifier.forward(&cls_embedding)?;
-
-        let probs = candle_nn::ops::softmax(&logits, candle_core::D::Minus1)?;
-        let probs_vec = probs.squeeze(0)?.to_vec1::<f32>()?;
-
-        // Güvenli Erişim
-        let pos = *probs_vec.get(self.pos_id).unwrap_or(&0.0) as f64;
-        let neg = *probs_vec.get(self.neg_id).unwrap_or(&0.0) as f64;
-
-        Ok(pos - neg)
     }
 }
 
 // ==============================================================================
-// 2. TIER 0: ULTRA-FAST PATH LEXICON (Nanosecond Resolution)
+// 2. TIER 0: ULTRA-FAST PATH LEXICON (O(1) Hashmap)
 // ==============================================================================
 
 static EXTREME_SIGNALS: phf::Map<&'static str, f64> = phf_map! {
@@ -155,12 +158,11 @@ static STANDARD_LEXICON: phf::Map<&'static str, f64> = phf_map! {
 };
 
 // ==============================================================================
-// 3. MULTI-TIER ORCHESTRATOR
+// 3. MULTI-TIER ORCHESTRATOR & SLA WATCHDOG
 // ==============================================================================
 
 pub struct VQIntelligenceCore {
-    tensor_engine: Option<TensorEngine>,
-    device: Device,
+    onnx_engine: Arc<Option<OnnxEngine>>,
 }
 
 impl Default for VQIntelligenceCore {
@@ -171,28 +173,23 @@ impl Default for VQIntelligenceCore {
 
 impl VQIntelligenceCore {
     pub fn build() -> Self {
-        let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
-        info!(
-            "🤖 VQ-Capital Multi-Tier Engine Başlatılıyor. Donanım: {:?}",
-            device
-        );
+        info!("🤖 VQ-Capital Multi-Tier Engine Başlatılıyor.");
 
-        let tensor_engine = match TensorEngine::load(&device) {
+        let onnx_engine = match OnnxEngine::load() {
             Ok(model) => Some(model),
             Err(e) => {
-                error!("🚨 [TENSOR HATASI] Model yüklenemedi: {}", e);
+                error!("🚨 [ONNX HATASI] Model yüklenemedi: {}", e);
                 warn!("⚠️ TIER-1 Devre Dışı! Sadece TIER-0 (O(1) Nanosecond Lexicon) çalışacak.");
                 None
             }
         };
 
         Self {
-            tensor_engine,
-            device,
+            onnx_engine: Arc::new(onnx_engine),
         }
     }
 
-    pub fn analyze(&self, text: &str) -> (f64, &'static str) {
+    pub async fn analyze_async(&self, text: &str) -> (f64, &'static str) {
         let start_time = Instant::now();
         let lower_text = text.to_lowercase();
 
@@ -203,16 +200,16 @@ impl VQIntelligenceCore {
             }
         }
 
-        if let Some(ref model) = self.tensor_engine {
-            match model.predict(text) {
-                Ok(ml_score) => {
-                    let elapsed = start_time.elapsed().as_micros();
-                    if elapsed > 10000 {
-                        warn!("⚠️ [SLA İHLALİ] Tensor süresi çok uzun: {}µs", elapsed);
-                    }
-                    return (ml_score, "TIER-1 (TENSOR)");
+        if let Some(engine) = self.onnx_engine.as_ref() {
+            let result = timeout(Duration::from_millis(4), engine.predict(text)).await;
+
+            match result {
+                Ok(Ok(ml_score)) => {
+                    let _eval_micros = start_time.elapsed().as_micros();
+                    return (ml_score, "TIER-1 (ONNX)");
                 }
-                Err(e) => warn!("⚠️ Tensor Hatası: {}. Tier-0'a Düşülüyor.", e),
+                Ok(Err(e)) => warn!("⚠️ ONNX Çıkarım Hatası: {}. Tier-0'a Düşülüyor.", e),
+                Err(_) => warn!("⏳ [SLA İHLALİ] Model 4ms'yi aştı. İşlem Timeout oldu (Aborted)."),
             }
         }
 
@@ -270,7 +267,7 @@ impl SentimentAnalyzerService for VQIntelligenceCore {
         &self,
         request: Request<AnalyzeTextRequest>,
     ) -> Result<Response<AnalyzeTextResponse>, Status> {
-        let (final_score, _) = self.analyze(&request.into_inner().text);
+        let (final_score, _) = self.analyze_async(&request.into_inner().text).await;
         Ok(Response::new(AnalyzeTextResponse { score: final_score }))
     }
 }
@@ -311,7 +308,7 @@ async fn main() -> Result<()> {
                     };
 
                     let start_eval = Instant::now();
-                    let (score, tier_used) = ai_arc.analyze(&raw_news.headline);
+                    let (score, tier_used) = ai_arc.analyze_async(&raw_news.headline).await;
                     let eval_time = start_eval.elapsed().as_micros();
 
                     if score.abs() < 0.05 {
@@ -356,8 +353,7 @@ async fn main() -> Result<()> {
     info!("⚡ Sentinel-Intelligence gRPC dinliyor: {}", addr);
 
     let service_clone = VQIntelligenceCore {
-        tensor_engine: None,
-        device: grpc_ai.device.clone(),
+        onnx_engine: grpc_ai.onnx_engine.clone(),
     };
 
     Server::builder()
