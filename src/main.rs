@@ -28,7 +28,7 @@ use sentinel_protos::intelligence::{AnalyzeTextRequest, AnalyzeTextResponse, Sem
 use sentinel_protos::market::RawNewsEvent;
 
 // ==============================================================================
-// 1. GERÇEK YAPAY ZEKA (FinancialBERT) - CANDLE GPU/CPU BACKEND
+// 1. GERÇEK YAPAY ZEKA (DistilRoBERTa) - CANDLE HFT BACKEND
 // ==============================================================================
 
 struct FinBertSlm {
@@ -42,27 +42,28 @@ struct FinBertSlm {
 
 impl FinBertSlm {
     fn load(device: &Device) -> Result<Self> {
-        let repo_id = "ahmedrachid/FinancialBERT-Sentiment-Analysis";
-        info!("⏳ [HF-HUB] {} ağırlıkları kontrol ediliyor...", repo_id);
+        // HFT ve Rust (Candle) ile en uyumlu, en hızlı model seçildi.
+        let repo_id = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis";
+        info!("⏳ [HF-HUB] {} ağırlıkları aranıyor...", repo_id);
 
-        let api = Api::new().context("HuggingFace API başlatılamadı")?;
+        let api = Api::new().context("HuggingFace API Error")?;
         let repo = api.model(repo_id.to_string());
 
-        let tokenizer_filename = repo.get("tokenizer.json").context("Tokenizer.json eksik")?;
+        // Hata fırlatmak yerine dosyaları dikkatlice çekiyoruz.
+        let tokenizer_filename = repo.get("tokenizer.json").context("Tokenizer bulunamadı")?;
         let weights_filename = repo
             .get("model.safetensors")
-            .context("model.safetensors eksik")?;
-        let config_filename = repo.get("config.json").context("Config.json eksik")?;
+            .context("Safetensors bulunamadı")?;
+        let config_filename = repo.get("config.json").context("Config bulunamadı")?;
 
         let config_str = std::fs::read_to_string(config_filename)?;
         let config: Config = serde_json::from_str(&config_str)?;
-
         let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
         let hidden_size = config_json["hidden_size"].as_u64().unwrap_or(768) as usize;
 
-        // DİNAMİK SINIF EŞLEME (Dynamic Label Mapping)
-        let mut pos_id = 2; // Varsayılan
-        let mut neg_id = 0; // Varsayılan
+        // Dinamik Sınıf Eşleme (0, 1, 2)
+        let mut pos_id = 2;
+        let mut neg_id = 0;
 
         if let Some(id2label) = config_json["id2label"].as_object() {
             for (id_str, label_val) in id2label {
@@ -77,14 +78,8 @@ impl FinBertSlm {
             }
         }
 
-        info!(
-            "🧠 Dinamik NLP Eşleşmesi -> Pozitif ID: {}, Negatif ID: {}",
-            pos_id, neg_id
-        );
-
         let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(|e| anyhow::anyhow!(e))?;
 
-        // Zero-Allocation / Fast-Boot (Mmap üzerinden belleğe alma)
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_filename], DType::F32, device)
                 .context("Safetensors mmap hatası")?
@@ -92,9 +87,12 @@ impl FinBertSlm {
 
         let bert = BertModel::load(vb.clone(), &config).context("Bert Modeli yüklenemedi")?;
         let classifier = candle_nn::linear(hidden_size, 3, vb.pp("classifier"))
-            .context("Classifier Katmanı yüklenemedi")?;
+            .context("Classifier yüklenemedi")?;
 
-        info!("✅ [CANDLE] FinancialBERT Başarıyla GPU/CPU Belleğine Yüklendi!");
+        info!(
+            "✅ [CANDLE] Model başarıyla yüklendi. (Pos: {}, Neg: {})",
+            pos_id, neg_id
+        );
 
         Ok(Self {
             bert,
@@ -113,7 +111,6 @@ impl FinBertSlm {
             .map_err(|e| anyhow::anyhow!(e))?;
         let mut token_ids = tokens.get_ids();
 
-        // HFT Koruması: Maksimum Sequence Length aşılırsa kes
         if token_ids.len() > 128 {
             token_ids = &token_ids[..128];
         }
@@ -125,19 +122,15 @@ impl FinBertSlm {
             Tensor::new(token_type_ids.as_slice(), &self.device)?.unsqueeze(0)?;
 
         let embeddings = self.bert.forward(&input_tensor, &token_type_tensor)?;
-
-        // [CLS] Tokeni Al (Sıra sınıflandırması için)
         let cls_embedding = embeddings.i((.., 0, ..))?;
         let logits = self.classifier.forward(&cls_embedding)?;
 
         let probs = candle_nn::ops::softmax(&logits, candle_core::D::Minus1)?;
         let probs_vec = probs.squeeze(0)?.to_vec1::<f32>()?;
 
-        // Dinamik ID'lere göre skorları al
         let pos = probs_vec[self.pos_id] as f64;
         let neg = probs_vec[self.neg_id] as f64;
 
-        // VQ-Capital Formatına Dönüştür: -1.0 (Ayı) ile +1.0 (Boğa)
         Ok(pos - neg)
     }
 }
@@ -173,14 +166,18 @@ impl Default for NativeRustAI {
 impl NativeRustAI {
     pub fn build() -> Self {
         let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
-        info!("🤖 VQ-Capital AI Motoru Başlatılıyor. Hedef: {:?}", device);
+        info!(
+            "🤖 VQ-Capital AI Motoru Başlatılıyor. Donanım: {:?}",
+            device
+        );
 
+        // Hata durumunda sistemi çökertmez.
         let slm = match FinBertSlm::load(&device) {
             Ok(model) => Some(model),
             Err(e) => {
-                error!("🚨 Kırmızı Alarm: SLM Modeli Yüklenemedi! Neden: {:?}", e);
+                error!("🚨 HF-Hub İndirme/Yükleme Hatası (Ağ veya Format): {}", e);
                 warn!(
-                    "⚠️ Sistem 'İlkel Sözlük (Lexicon)' Moduna düşürülerek çalışmaya devam edecek!"
+                    "⚠️ HFT Kesintiye Uğramayacak! Sistem 'Lexicon (Sözlük)' modunda devam ediyor."
                 );
                 None
             }
@@ -193,7 +190,7 @@ impl NativeRustAI {
         if let Some(ref model) = self.slm {
             match model.predict(text) {
                 Ok(ml_score) => return ml_score,
-                Err(e) => warn!("⚠️ NLP Çıkarım Hatası (Fallback Yapılıyor): {}", e),
+                Err(e) => warn!("⚠️ NLP Inference Hatası: {}", e),
             }
         }
 
@@ -255,7 +252,7 @@ impl SentimentAnalyzerService for NativeRustAI {
 }
 
 // ==============================================================================
-// 4. MAIN RUNTIME (WORKER & GRPC)
+// 4. MAIN RUNTIME
 // ==============================================================================
 
 #[tokio::main]
@@ -278,9 +275,7 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         if let Ok(mut sub) = nats_client.subscribe("news.raw.>").await {
-            info!(
-                "📡 AI Tensor Worker: Haber Akışına Bağlandı. Gerçek dünya entitileri taranıyor..."
-            );
+            info!("📡 AI Tensor Worker: Haber Akışına Bağlandı.");
 
             while let Some(msg) = sub.next().await {
                 if let Ok(raw_news) = RawNewsEvent::decode(msg.payload) {
@@ -316,14 +311,12 @@ async fn main() -> Result<()> {
                             "🔴 AYI"
                         };
                         info!(
-                            "🧠 [NLP-CUDA] {} {} (Skor: {:.2}) | {}",
+                            "🧠 [NLP] {} {} (Skor: {:.2}) | {}",
                             symbol, direction, score, vector.original_headline
                         );
                     }
                 }
             }
-        } else {
-            warn!("⚠️ AI Worker NATS'a abone olamadı.");
         }
     });
 
