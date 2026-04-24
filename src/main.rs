@@ -1,6 +1,6 @@
 // ========== DOSYA: sentinel-intelligence/src/main.rs ==========
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Module, Tensor}; // <-- EKLENDİ: Module
 use candle_nn::{Linear, VarBuilder};
 use candle_transformers::models::bert::{BertModel, Config};
 use futures_util::StreamExt;
@@ -41,16 +41,24 @@ struct FinBertSlm {
 impl FinBertSlm {
     fn load(device: &Device) -> Result<Self> {
         info!("⏳ [HF-HUB] ProsusAI/finbert ağırlıkları kontrol ediliyor...");
-        
+
         let api = Api::new().context("HuggingFace API başlatılamadı")?;
         let repo = api.model("ProsusAI/finbert".to_string());
 
         let tokenizer_filename = repo.get("tokenizer.json").context("Tokenizer eksik")?;
-        let weights_filename = repo.get("model.safetensors").context("Model ağırlıkları eksik")?;
+        let weights_filename = repo
+            .get("model.safetensors")
+            .context("Model ağırlıkları eksik")?;
         let config_filename = repo.get("config.json").context("Config eksik")?;
 
         let config_str = std::fs::read_to_string(config_filename)?;
         let config: Config = serde_json::from_str(&config_str)?;
+
+        // DÜZELTME: candle_transformers::models::bert::Config içindeki
+        // alanlar crate'in dışına kapalı (private) olduğu için, JSON üzerinden boyut okuması yapıyoruz.
+        let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
+        let hidden_size = config_json["hidden_size"].as_u64().unwrap_or(768) as usize;
+
         let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(|e| anyhow::anyhow!(e))?;
 
         // Zero-Allocation / Fast-Boot (Mmap üzerinden belleğe alma)
@@ -60,7 +68,7 @@ impl FinBertSlm {
         };
 
         let bert = BertModel::load(vb.clone(), &config).context("Bert Modeli yüklenemedi")?;
-        let classifier = candle_nn::linear(config.hidden_size, 3, vb.pp("classifier"))
+        let classifier = candle_nn::linear(hidden_size, 3, vb.pp("classifier"))
             .context("Classifier Katmanı yüklenemedi")?;
 
         info!("✅ [CANDLE] FinBERT Başarıyla GPU/CPU Belleğine Yüklendi!");
@@ -88,10 +96,11 @@ impl FinBertSlm {
         let token_type_ids = vec![0u32; token_ids.len()];
 
         let input_tensor = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
-        let token_type_tensor = Tensor::new(token_type_ids.as_slice(), &self.device)?.unsqueeze(0)?;
+        let token_type_tensor =
+            Tensor::new(token_type_ids.as_slice(), &self.device)?.unsqueeze(0)?;
 
         let embeddings = self.bert.forward(&input_tensor, &token_type_tensor)?;
-        
+
         // [CLS] Tokeni Al (Sıra sınıflandırması için)
         let cls_embedding = embeddings.i((.., 0, ..))?;
         let logits = self.classifier.forward(&cls_embedding)?;
@@ -145,8 +154,13 @@ impl NativeRustAI {
         let slm = match FinBertSlm::load(&device) {
             Ok(model) => Some(model),
             Err(e) => {
-                error!("🚨 Kırmızı Alarm: FinBERT Modeli Yüklenemedi! Neden: {:?}", e);
-                warn!("⚠️ Sistem 'İlkel Sözlük (Lexicon)' Moduna düşürülerek çalışmaya devam edecek!");
+                error!(
+                    "🚨 Kırmızı Alarm: FinBERT Modeli Yüklenemedi! Neden: {:?}",
+                    e
+                );
+                warn!(
+                    "⚠️ Sistem 'İlkel Sözlük (Lexicon)' Moduna düşürülerek çalışmaya devam edecek!"
+                );
                 None
             }
         };
@@ -183,16 +197,28 @@ impl NativeRustAI {
 
     // Gerçek Dünya Varlık İsmi Tanıma (NER)
     pub fn extract_symbol(text_upper: &str) -> Option<&'static str> {
-        if text_upper.contains("BITCOIN") || text_upper.contains("BTC ") || text_upper.contains(" BTC") {
+        if text_upper.contains("BITCOIN")
+            || text_upper.contains("BTC ")
+            || text_upper.contains(" BTC")
+        {
             return Some("BTCUSDT");
         }
-        if text_upper.contains("ETHEREUM") || text_upper.contains("ETHER") || text_upper.contains("ETH ") {
+        if text_upper.contains("ETHEREUM")
+            || text_upper.contains("ETHER")
+            || text_upper.contains("ETH ")
+        {
             return Some("ETHUSDT");
         }
-        if text_upper.contains("SOLANA") || text_upper.contains("SOL ") || text_upper.contains(" SOL") {
+        if text_upper.contains("SOLANA")
+            || text_upper.contains("SOL ")
+            || text_upper.contains(" SOL")
+        {
             return Some("SOLUSDT");
         }
-        if text_upper.contains("BINANCE") || text_upper.contains("BNB ") || text_upper.contains(" BNB") {
+        if text_upper.contains("BINANCE")
+            || text_upper.contains("BNB ")
+            || text_upper.contains(" BNB")
+        {
             return Some("BNBUSDT");
         }
         None
@@ -218,22 +244,27 @@ impl SentimentAnalyzerService for NativeRustAI {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-    let nats_client = async_nats::connect(&nats_url).await.context("CRITICAL: NATS bağlanılamadı")?;
+    let nats_url =
+        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let nats_client = async_nats::connect(&nats_url)
+        .await
+        .context("CRITICAL: NATS bağlanılamadı")?;
 
-    // Model yükleme işlemi bloklayıcı (Senkron) olduğundan, tokio'nun kendi yapısı 
+    // Model yükleme işlemi bloklayıcı (Senkron) olduğundan, tokio'nun kendi yapısı
     // içinde engellememesi için tokio block_in_place kullanıyoruz.
-    let ai_service = tokio::task::spawn_blocking(|| NativeRustAI::build())
+    let ai_service = tokio::task::spawn_blocking(NativeRustAI::build)
         .await
         .context("AI Builder Panic Hatası")?;
-        
+
     let ai_arc = Arc::new(ai_service);
     let grpc_ai = ai_arc.clone();
     let nats_pub = nats_client.clone();
 
     tokio::spawn(async move {
         if let Ok(mut sub) = nats_client.subscribe("news.raw.>").await {
-            info!("📡 AI Tensor Worker: Haber Akışına Bağlandı. Gerçek dünya entitileri taranıyor...");
+            info!(
+                "📡 AI Tensor Worker: Haber Akışına Bağlandı. Gerçek dünya entitileri taranıyor..."
+            );
 
             while let Some(msg) = sub.next().await {
                 if let Ok(raw_news) = RawNewsEvent::decode(msg.payload) {
@@ -260,8 +291,14 @@ async fn main() -> Result<()> {
 
                     let mut buf = Vec::new();
                     if vector.encode(&mut buf).is_ok() {
-                        let _ = nats_pub.publish("intelligence.news.vector".to_string(), buf.into()).await;
-                        let direction = if score > 0.0 { "🟢 BOĞA" } else { "🔴 AYI" };
+                        let _ = nats_pub
+                            .publish("intelligence.news.vector".to_string(), buf.into())
+                            .await;
+                        let direction = if score > 0.0 {
+                            "🟢 BOĞA"
+                        } else {
+                            "🔴 AYI"
+                        };
                         info!(
                             "🧠 [FinBERT-CUDA] {} {} (Skor: {:.2}) | {}",
                             symbol, direction, score, vector.original_headline
@@ -276,10 +313,13 @@ async fn main() -> Result<()> {
 
     let addr = "0.0.0.0:50051".parse()?;
     info!("⚡ Sentinel-Intelligence gRPC dinliyor: {}", addr);
-    
+
     // Klone as service metodu
-    let service_clone = NativeRustAI { slm: None, device: grpc_ai.device.clone() }; // Shallow clone for grpc since main loop does the heavy lifting
-    
+    let service_clone = NativeRustAI {
+        slm: None,
+        device: grpc_ai.device.clone(),
+    }; // Shallow clone for grpc since main loop does the heavy lifting
+
     Server::builder()
         .add_service(SentimentAnalyzerServiceServer::new(service_clone))
         .serve(addr)
