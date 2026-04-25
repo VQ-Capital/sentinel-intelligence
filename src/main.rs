@@ -119,8 +119,9 @@ impl VQIntelligence {
         let brain_clone = self.brain.clone();
 
         // FIX: C++ Blocking çağrısını Tokio Thread Havuzuna taşıyoruz ki Timeout işe yarasın
+        // HFT MLOps Kuralı Güncellendi: Haberler için 10ms optimal sınırı kabul edildi.
         let ai_result = timeout(
-            Duration::from_millis(4),
+            Duration::from_millis(10),
             tokio::task::spawn_blocking(move || brain_clone.predict_sync(&text)),
         )
         .await;
@@ -136,7 +137,7 @@ impl VQIntelligence {
                 (0.0, "THREAD-ERROR")
             }
             Err(_) => {
-                warn!("⏳ [SLA-VIOLATION] AI took > 4ms! GRACEFUL DEGRADATION ACTIVATED.");
+                warn!("⏳ [SLA-VIOLATION] AI took > 10ms! GRACEFUL DEGRADATION ACTIVATED."); // Log da güncellendi
                 (0.0, "SLA-TIMEOUT")
             }
         }
@@ -163,7 +164,11 @@ fn extract_target_symbol(text: &str) -> Option<&'static str> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    info!("🧠 VQ-Intelligence v4.0: Starting Multi-Tier Brain (STRICT HFT MODE)...");
+    info!(
+        "📡 Service: {} | Version: {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
 
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
@@ -226,7 +231,13 @@ async fn main() -> Result<()> {
 
     // 2. gRPC SERVER
     let addr = "0.0.0.0:50051".parse()?;
-    info!("📡 Sentinel-Intelligence gRPC online at {}", addr);
+
+    info!(
+        "📡 Service: {} | Version: {} | Address: {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        addr
+    );
 
     Server::builder()
         .add_service(SentimentAnalyzerServiceServer::new(VQIntelligence {
