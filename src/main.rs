@@ -222,8 +222,10 @@ async fn main() -> Result<()> {
                         .process_full_stack(news.headline.clone())
                         .await;
 
+                    // 🎯 KRİTİK FİLTRE: Sadece Sembol bulursak VE Skor etkiliyse konuş!
                     if let Some(symbol) = extract_target_symbol(&news.headline) {
-                        if score.abs() > 0.05 {
+                        // Skor 0.10'dan büyükse (önemli bir haber) ekrana bas
+                        if score.abs() > 0.10 {
                             let vector = SemanticVector {
                                 symbol: symbol.to_string(),
                                 sentiment_score: score,
@@ -237,9 +239,11 @@ async fn main() -> Result<()> {
                                 let _ = nats_clone
                                     .publish("intelligence.news.vector".to_string(), buf.into())
                                     .await;
+
+                                // 📢 SADECE BU LOG EKRANDA GÖRÜNECEK
                                 info!(
-                                    "⚡ [INTEL] {} | Score: {:.2} | Method: {} | Latency: {:?} | Symbol: {}",
-                                    vector.original_headline, score, method, start.elapsed(), symbol
+                                    "🧠 [ALPHA-DETECTED] {} | Score: {:.2} ({}) | Symbol: {} | Latency: {:?}",
+                                    vector.original_headline, score, method, symbol, start.elapsed()
                                 );
                             }
                         }
