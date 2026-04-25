@@ -1,10 +1,11 @@
 // ========== DOSYA: sentinel-intelligence/src/main.rs ==========
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use ort::execution_providers::CUDAExecutionProvider;
 use ort::{session::Session, value::Value};
 use phf::phf_map;
 use prost::Message;
-use std::sync::{Arc, Mutex}; // FIX: std::sync::Mutex eklendi (Senkron kilit)
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::time::{timeout, Duration};
@@ -43,14 +44,11 @@ static FAST_PATH_WORDS: phf::Map<&'static str, f64> = phf_map! {
 // 🤖 TIER-1: NEURAL ENGINE (Thread-Safe & Zero-Blocking)
 // -----------------------------------------------------------------------------
 struct NeuralBrain {
-    // FIX: Tokio kilidi değil, standart donanım kilidi kullanıyoruz.
-    // Blocking thread içinde kullanılacağı için en performanslısı budur.
     session: Mutex<Session>,
     tokenizer: Tokenizer,
 }
 
 impl NeuralBrain {
-    // FIX: Referans immutable (&self) kalıyor, interior mutability Mutex üzerinden sağlanıyor.
     fn predict_sync(&self, text: &str) -> Result<f64> {
         let tokens = self
             .tokenizer
@@ -63,7 +61,6 @@ impl NeuralBrain {
         let mask = Value::from_array(([1, seq_len], vec![1i64; seq_len]))?;
         let type_ids = Value::from_array(([1, seq_len], vec![0i64; seq_len]))?;
 
-        // FIX: Mutex kilidini alıyoruz (Sadece model inference süresince kilitler)
         let mut session_guard = self
             .session
             .lock()
@@ -91,6 +88,7 @@ impl NeuralBrain {
 // -----------------------------------------------------------------------------
 pub struct VQIntelligence {
     brain: Arc<NeuralBrain>,
+    sla_timeout_ms: u64, // YENİ: Dinamik SLA limiti
 }
 
 #[tonic::async_trait]
@@ -115,13 +113,11 @@ impl VQIntelligence {
             }
         }
 
-        // Tier-1: Neural with STRICT 4ms Timeout (Cancellation-Safe)
+        // Tier-1: Neural with DYNAMIC SLA Timeout (Cancellation-Safe)
         let brain_clone = self.brain.clone();
 
-        // FIX: C++ Blocking çağrısını Tokio Thread Havuzuna taşıyoruz ki Timeout işe yarasın
-        // HFT MLOps Kuralı Güncellendi: Haberler için 10ms optimal sınırı kabul edildi.
         let ai_result = timeout(
-            Duration::from_millis(10),
+            Duration::from_millis(self.sla_timeout_ms), // YENİ: ENV üzerinden okunan değer
             tokio::task::spawn_blocking(move || brain_clone.predict_sync(&text)),
         )
         .await;
@@ -137,7 +133,11 @@ impl VQIntelligence {
                 (0.0, "THREAD-ERROR")
             }
             Err(_) => {
-                warn!("⏳ [SLA-VIOLATION] AI took > 10ms! GRACEFUL DEGRADATION ACTIVATED."); // Log da güncellendi
+                // Log da dinamik oldu
+                warn!(
+                    "⏳ [SLA-VIOLATION] AI took > {}ms! GRACEFUL DEGRADATION ACTIVATED.",
+                    self.sla_timeout_ms
+                );
                 (0.0, "SLA-TIMEOUT")
             }
         }
@@ -172,6 +172,18 @@ async fn main() -> Result<()> {
 
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+
+    // YENİ: SLA Timeout değişkenini oku, yoksa varsayılan 10ms yap.
+    let sla_timeout_ms = std::env::var("SLA_TIMEOUT_MS")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse::<u64>()
+        .unwrap_or(10);
+
+    info!(
+        "⚙️ AI Neural Engine SLA Timeout set to: {}ms",
+        sla_timeout_ms
+    );
+
     let nats_client = async_nats::connect(&nats_url)
         .await
         .context("NATS Connection Failed")?;
@@ -182,12 +194,21 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "/opt/models/tokenizer.json".to_string());
 
     let brain = Arc::new(NeuralBrain {
-        // FIX: Session objesi std::sync::Mutex ile sarmalandı
-        session: Mutex::new(Session::builder()?.commit_from_file(model_path)?),
+        session: Mutex::new(
+            Session::builder()?
+                .with_execution_providers([CUDAExecutionProvider::default().build()])
+                .map_err(|e| anyhow::anyhow!("CUDA Başlatılamadı: {}", e))?
+                .commit_from_file(model_path)?,
+        ),
         tokenizer: Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!(e))?,
+        // sla_timeout_ms BURADAN SİLİNDİ!
     });
 
-    let intel_service = Arc::new(VQIntelligence { brain });
+    // sla_timeout_ms SADECE BURADA OLMALI!
+    let intel_service = Arc::new(VQIntelligence {
+        brain,
+        sla_timeout_ms,
+    });
 
     // 1. NATS WORKER LOOP
     let nats_clone = nats_client.clone();
@@ -197,7 +218,6 @@ async fn main() -> Result<()> {
             while let Some(msg) = sub.next().await {
                 if let Ok(news) = RawNewsEvent::decode(msg.payload) {
                     let start = Instant::now();
-                    // FIX: String sahipliğini (ownership) alıyoruz
                     let (score, method) = service_clone
                         .process_full_stack(news.headline.clone())
                         .await;
@@ -242,6 +262,7 @@ async fn main() -> Result<()> {
     Server::builder()
         .add_service(SentimentAnalyzerServiceServer::new(VQIntelligence {
             brain: intel_service.brain.clone(),
+            sla_timeout_ms,
         }))
         .serve(addr)
         .await?;
