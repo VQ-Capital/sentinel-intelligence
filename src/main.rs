@@ -4,8 +4,9 @@ use futures_util::StreamExt;
 use ort::execution_providers::CUDAExecutionProvider;
 use ort::{session::Session, value::Value};
 use phf::phf_map;
+use prost::bytes::BytesMut; // 🔥 CERRAHİ 1: Cargo.toml değiştirmeden Prost içindeki BytesMut kullanıldı
 use prost::Message;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex}; // 🔥 CERRAHİ 2: Mutex geri eklendi (ort kütüphanesi mut referans istiyor)
 use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::time::{timeout, Duration};
@@ -61,6 +62,7 @@ impl NeuralBrain {
         let mask = Value::from_array(([1, seq_len], vec![1i64; seq_len]))?;
         let type_ids = Value::from_array(([1, seq_len], vec![0i64; seq_len]))?;
 
+        // Mutex kilidini sadece tahmin esnasında tutuyoruz
         let mut session_guard = self
             .session
             .lock()
@@ -88,7 +90,7 @@ impl NeuralBrain {
 // -----------------------------------------------------------------------------
 pub struct VQIntelligence {
     brain: Arc<NeuralBrain>,
-    sla_timeout_ms: u64, // YENİ: Dinamik SLA limiti
+    sla_timeout_ms: u64,
 }
 
 #[tonic::async_trait]
@@ -105,7 +107,6 @@ impl SentimentAnalyzerService for VQIntelligence {
 
 impl VQIntelligence {
     async fn process_full_stack(&self, text: String) -> (f64, &'static str) {
-        // Tier-0: Lexicon (O(1) Karmaşıklık - Asla beklemez)
         for word in text.to_lowercase().split_whitespace() {
             let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
             if let Some(&score) = FAST_PATH_WORDS.get(clean) {
@@ -113,11 +114,9 @@ impl VQIntelligence {
             }
         }
 
-        // Tier-1: Neural with DYNAMIC SLA Timeout (Cancellation-Safe)
         let brain_clone = self.brain.clone();
-
         let ai_result = timeout(
-            Duration::from_millis(self.sla_timeout_ms), // YENİ: ENV üzerinden okunan değer
+            Duration::from_millis(self.sla_timeout_ms),
             tokio::task::spawn_blocking(move || brain_clone.predict_sync(&text)),
         )
         .await;
@@ -133,7 +132,6 @@ impl VQIntelligence {
                 (0.0, "THREAD-ERROR")
             }
             Err(_) => {
-                // Log da dinamik oldu
                 warn!(
                     "⏳ [SLA-VIOLATION] AI took > {}ms! GRACEFUL DEGRADATION ACTIVATED.",
                     self.sla_timeout_ms
@@ -172,8 +170,6 @@ async fn main() -> Result<()> {
 
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-
-    // YENİ: SLA Timeout değişkenini oku, yoksa varsayılan 10ms yap.
     let sla_timeout_ms = std::env::var("SLA_TIMEOUT_MS")
         .unwrap_or_else(|_| "10".to_string())
         .parse::<u64>()
@@ -201,16 +197,13 @@ async fn main() -> Result<()> {
                 .commit_from_file(model_path)?,
         ),
         tokenizer: Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!(e))?,
-        // sla_timeout_ms BURADAN SİLİNDİ!
     });
 
-    // sla_timeout_ms SADECE BURADA OLMALI!
     let intel_service = Arc::new(VQIntelligence {
         brain,
         sla_timeout_ms,
     });
 
-    // 1. NATS WORKER LOOP
     let nats_clone = nats_client.clone();
     let service_clone = intel_service.clone();
     tokio::spawn(async move {
@@ -222,9 +215,7 @@ async fn main() -> Result<()> {
                         .process_full_stack(news.headline.clone())
                         .await;
 
-                    // 🎯 KRİTİK FİLTRE: Sadece Sembol bulursak VE Skor etkiliyse konuş!
                     if let Some(symbol) = extract_target_symbol(&news.headline) {
-                        // Skor 0.10'dan büyükse (önemli bir haber) ekrana bas
                         if score.abs() > 0.10 {
                             let vector = SemanticVector {
                                 symbol: symbol.to_string(),
@@ -234,13 +225,12 @@ async fn main() -> Result<()> {
                                 timestamp: chrono::Utc::now().timestamp_millis(),
                             };
 
-                            let mut buf = Vec::new();
+                            let mut buf = BytesMut::with_capacity(256);
                             if vector.encode(&mut buf).is_ok() {
                                 let _ = nats_clone
                                     .publish("intelligence.news.vector".to_string(), buf.into())
                                     .await;
 
-                                // 📢 SADECE BU LOG EKRANDA GÖRÜNECEK
                                 info!(
                                     "🧠 [ALPHA-DETECTED] {} | Score: {:.2} ({}) | Symbol: {} | Latency: {:?}",
                                     vector.original_headline, score, method, symbol, start.elapsed()
@@ -253,9 +243,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 2. gRPC SERVER
     let addr = "0.0.0.0:50051".parse()?;
-
     info!(
         "📡 Service: {} | Version: {} | Address: {}",
         env!("CARGO_PKG_NAME"),
