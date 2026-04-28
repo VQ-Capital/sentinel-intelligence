@@ -1,17 +1,16 @@
 // ========== DOSYA: sentinel-intelligence/src/main.rs ==========
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use ort::execution_providers::CUDAExecutionProvider;
-use ort::{session::Session, value::Value};
 use phf::phf_map;
-use prost::bytes::BytesMut; // 🔥 CERRAHİ 1: Cargo.toml değiştirmeden Prost içindeki BytesMut kullanıldı
+use prost::bytes::BytesMut;
 use prost::Message;
-use std::sync::{Arc, Mutex}; // 🔥 CERRAHİ 2: Mutex geri eklendi (ort kütüphanesi mut referans istiyor)
+use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::time::{timeout, Duration};
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{error, info, warn};
+use tract_onnx::prelude::*;
 
 pub mod sentinel_protos {
     pub mod intelligence {
@@ -42,10 +41,11 @@ static FAST_PATH_WORDS: phf::Map<&'static str, f64> = phf_map! {
 };
 
 // -----------------------------------------------------------------------------
-// 🤖 TIER-1: NEURAL ENGINE (Thread-Safe & Zero-Blocking)
+// 🤖 TIER-1: PURE RUST NEURAL ENGINE (Tract / Lock-Free)
 // -----------------------------------------------------------------------------
 struct NeuralBrain {
-    session: Mutex<Session>,
+    // 🔥 CERRAHİ: TypedSimplePlan Send+Sync'tir. Mutex'e gerek yoktur!
+    model: TypedSimplePlan<TypedModel>,
     tokenizer: Tokenizer,
 }
 
@@ -54,30 +54,35 @@ impl NeuralBrain {
         let tokens = self
             .tokenizer
             .encode(text, true)
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
         let token_ids: Vec<i64> = tokens.get_ids().iter().map(|&x| x as i64).collect();
         let seq_len = token_ids.len();
 
-        let input_ids = Value::from_array(([1, seq_len], token_ids))?;
-        let mask = Value::from_array(([1, seq_len], vec![1i64; seq_len]))?;
-        let type_ids = Value::from_array(([1, seq_len], vec![0i64; seq_len]))?;
+        // Tract için Tensörleri Hazırla (Shape: [1, seq_len])
+        let input_ids = tract_ndarray::Array2::from_shape_vec((1, seq_len), token_ids.clone())
+            .context("Input_ids array shape error")?
+            .into_tensor();
 
-        // Mutex kilidini sadece tahmin esnasında tutuyoruz
-        let mut session_guard = self
-            .session
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))?;
+        let mask = tract_ndarray::Array2::from_shape_vec((1, seq_len), vec![1i64; seq_len])
+            .context("Mask array shape error")?
+            .into_tensor();
 
-        let outputs = session_guard.run(ort::inputs![
-            "input_ids" => input_ids,
-            "attention_mask" => mask,
-            "token_type_ids" => type_ids,
-        ])?;
+        let type_ids = tract_ndarray::Array2::from_shape_vec((1, seq_len), vec![0i64; seq_len])
+            .context("Type_ids array shape error")?
+            .into_tensor();
 
-        let logits = outputs["logits"].try_extract_tensor::<f32>()?;
-        let slice = logits.1;
+        // Optimum ile export edilen modelin giriş sırası: input_ids, attention_mask, token_type_ids
+        let inputs = tvec![input_ids.into(), mask.into(), type_ids.into()];
+
+        // Kilit (Mutex) olmadan paralel run() çalıştırılıyor!
+        let outputs = self.model.run(inputs).context("Tract Execution Error")?;
+
+        let logits_view = outputs[0].to_array_view::<f32>()?;
+        let slice = logits_view.as_slice().context("Logits extraction error")?;
 
         if slice.len() >= 3 {
+            // [Negative, Neutral, Positive]
             Ok((slice[2] - slice[0]) as f64)
         } else {
             Ok(0.0)
@@ -107,6 +112,7 @@ impl SentimentAnalyzerService for VQIntelligence {
 
 impl VQIntelligence {
     async fn process_full_stack(&self, text: String) -> (f64, &'static str) {
+        // TIER-0: O(1) Lexicon Fast-Path
         for word in text.to_lowercase().split_whitespace() {
             let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
             if let Some(&score) = FAST_PATH_WORDS.get(clean) {
@@ -114,6 +120,7 @@ impl VQIntelligence {
             }
         }
 
+        // TIER-1: Pure Rust Neural Predict
         let brain_clone = self.brain.clone();
         let ai_result = timeout(
             Duration::from_millis(self.sla_timeout_ms),
@@ -122,7 +129,7 @@ impl VQIntelligence {
         .await;
 
         match ai_result {
-            Ok(Ok(Ok(score))) => (score, "TIER-1 (NEURAL)"),
+            Ok(Ok(Ok(score))) => (score, "TIER-1 (RUST-NEURAL)"),
             Ok(Ok(Err(e))) => {
                 error!("Neural Prediction Error: {}", e);
                 (0.0, "NEURAL-ERROR")
@@ -163,7 +170,7 @@ fn extract_target_symbol(text: &str) -> Option<&'static str> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     info!(
-        "📡 Service: {} | Version: {}",
+        "📡 Service: {} | Version: {} (V5 PURE RUST AI)",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
@@ -171,12 +178,12 @@ async fn main() -> Result<()> {
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
     let sla_timeout_ms = std::env::var("SLA_TIMEOUT_MS")
-        .unwrap_or_else(|_| "10".to_string())
+        .unwrap_or_else(|_| "25".to_string())
         .parse::<u64>()
-        .unwrap_or(10);
+        .unwrap_or(25);
 
     info!(
-        "⚙️ AI Neural Engine SLA Timeout set to: {}ms",
+        "⚙️ Pure Rust AI Engine SLA Timeout set to: {}ms",
         sla_timeout_ms
     );
 
@@ -189,21 +196,26 @@ async fn main() -> Result<()> {
     let tokenizer_path = std::env::var("TOKENIZER_PATH")
         .unwrap_or_else(|_| "/opt/models/tokenizer.json".to_string());
 
+    info!("🧠 Tract Modeli Yükleniyor... Bu işlem birkaç saniye sürebilir.");
+
+    let model = tract_onnx::onnx()
+        .model_for_path(&model_path)?
+        .into_optimized()?
+        .into_runnable()?;
+
     let brain = Arc::new(NeuralBrain {
-        session: Mutex::new(
-            Session::builder()?
-                .with_execution_providers([CUDAExecutionProvider::default().build()])
-                .map_err(|e| anyhow::anyhow!("CUDA Başlatılamadı: {}", e))?
-                .commit_from_file(model_path)?,
-        ),
-        tokenizer: Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!(e))?,
+        model,
+        tokenizer: Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
     });
+    info!("✅ PURE RUST AI ENGINE BAŞARIYLA BAŞLATILDI!");
 
     let intel_service = Arc::new(VQIntelligence {
         brain,
         sla_timeout_ms,
     });
 
+    // Haberleri dinleyen Asenkron Task
     let nats_clone = nats_client.clone();
     let service_clone = intel_service.clone();
     tokio::spawn(async move {
@@ -244,12 +256,7 @@ async fn main() -> Result<()> {
     });
 
     let addr = "0.0.0.0:50051".parse()?;
-    info!(
-        "📡 Service: {} | Version: {} | Address: {}",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-        addr
-    );
+    info!("📡 gRPC Endpoint Hazır: {}", addr);
 
     Server::builder()
         .add_service(SentimentAnalyzerServiceServer::new(VQIntelligence {

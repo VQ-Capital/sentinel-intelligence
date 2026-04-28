@@ -1,8 +1,9 @@
 # ========== DOSYA: sentinel-intelligence/Cargo.toml ==========
 [package]
 name = "sentinel-intelligence"
-version = "4.0.3"
+version = "5.0.0"
 edition = "2021"
+description = "VQ-Capital V5 Pure Rust Neural Engine (Tract/Lock-Free)"
 
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
@@ -13,8 +14,8 @@ tracing-subscriber = "0.3"
 chrono = "0.4"
 futures-util = "0.3"
 
-# AI Modülleri
-ort = { version = "2.0.0-rc.9", features = ["cuda"] } 
+# 🚀 V5 AI Modülleri (PURE RUST & NO C++)
+tract-onnx = "0.21"
 tokenizers = { version = "0.15", default-features = false, features = ["onig"] }
 phf = { version = "0.11", features = ["macros"] }
 
